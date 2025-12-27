@@ -1,8 +1,10 @@
 .DS_Store
 __pycache__/
 .venv/
-data/
-reports/
-site/
 .env
 *.env
+
+data/
+reports/
+analysis/
+site/

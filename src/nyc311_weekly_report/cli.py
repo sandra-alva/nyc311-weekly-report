@@ -3,6 +3,7 @@ load_dotenv()
 
 
 import argparse
+import json
 from datetime import datetime, timezone
 
 from pathlib import Path
@@ -67,6 +68,11 @@ def main() -> None:
     p_pub = sub.add_parser("publish", help="Render the latest Markdown report into site/ as HTML.")
     p_build = sub.add_parser("build-site", help="Run dashboard, charts, narrate, report, and publish.")
     p_build.add_argument("--model", default=None, help="Override OPENAI_MODEL/default model.")
+    p_refresh = sub.add_parser("refresh", help="Run full pipeline: ingest → publish.")
+    p_refresh.add_argument("--weekly-days", type=int, default=7, help="Days to fetch for weekly ingest.")
+    p_refresh.add_argument("--trend-days", type=int, default=365, help="Days to fetch for trend ingest.")
+    p_refresh.add_argument("--skip-narrate", action="store_true", help="Skip LLM narrative (no OPENAI_API_KEY needed).")
+    p_refresh.add_argument("--model", default=None, help="Override OPENAI_MODEL/default model.")
 
 
     parser.add_argument("--version", action="store_true", help="Print version and exit.")
@@ -256,6 +262,110 @@ def main() -> None:
         index_path, report_path = publish_latest()
         print(f"Wrote {index_path.resolve()}")
         print(f"Wrote {report_path.resolve()}")
+        return
+    if args.cmd == "refresh":
+        from nyc311_weekly_report.dashboard import main as dashboard_main
+        from nyc311_weekly_report.charts import generate_charts
+        from nyc311_weekly_report.narrate import (
+            build_messages,
+            build_payload,
+            call_openai_for_json,
+            load_dashboard_metrics_optional,
+            load_trend_metrics_optional,
+            load_weekly_metrics,
+            render_markdown,
+            save_json,
+            save_md,
+            validate_narrative_schema,
+        )
+        from nyc311_weekly_report.report import generate_report
+        from nyc311_weekly_report.publish import publish_latest
+        from nyc311_weekly_report.trend import (
+            ingest_trends,
+            TREND_RAW_PATH,
+            analyze_trends,
+            save_trend_metrics,
+            TREND_METRICS_PATH,
+        )
+
+        def _log(msg: str) -> None:
+            print(f"[refresh] {msg}")
+
+        try:
+            _log(f"Ingesting last {args.weekly_days} days...")
+            rows, start_str, end_str = fetch_last_n_days_soda3(n_days=args.weekly_days, page_size=5000)
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            out = RAW_DIR / f"nyc311_last_{args.weekly_days}_days_{ts}.json"
+            payload = {
+                "meta": {
+                    "dataset": "erm2-nwe9",
+                    "days": args.weekly_days,
+                    "start": start_str,
+                    "end": end_str,
+                    "timezone": "America/New_York",
+                    "row_count": len(rows),
+                },
+                "rows": rows,
+            }
+            save_raw_snapshot(payload, out)
+
+            _log("Analyzing weekly metrics...")
+            meta, rows_loaded = load_latest_raw()
+            metrics = compute_weekly_metrics(rows_loaded, meta=meta)
+            weekly_out = Path("data/processed/weekly_metrics.json")
+            save_metrics(metrics, weekly_out)
+
+            _log(f"Ingesting trend data ({args.trend_days} days)...")
+            ingest_trends(
+                days=args.trend_days,
+                include_borough=True,
+                include_complaints=True,
+                top_complaints=5,
+                out_path=TREND_RAW_PATH,
+            )
+
+            _log("Analyzing trends...")
+            trend_raw = json.loads(TREND_RAW_PATH.read_text(encoding="utf-8"))
+            trend_metrics = analyze_trends(trend_raw)
+            save_trend_metrics(trend_metrics, TREND_METRICS_PATH)
+
+            _log("Building dashboard...")
+            dashboard_main()
+
+            _log("Generating charts...")
+            generate_charts()
+
+            if not args.skip_narrate:
+                api_key = os.getenv("OPENAI_API_KEY")
+                if not api_key:
+                    _log("OPENAI_API_KEY not set; skipping narrate.")
+                else:
+                    try:
+                        _log("Running narrate via OpenAI...")
+                        dashboard = load_dashboard_metrics_optional(Path("data/processed/dashboard.json"))
+                        weekly = load_weekly_metrics(Path("data/processed/weekly_metrics.json")) if dashboard is None else None
+                        trend = load_trend_metrics_optional(Path("data/processed/trend_metrics.json")) if dashboard is None else None
+                        payload = build_payload(dashboard=dashboard, weekly=weekly, trend=trend)
+                        messages = build_messages(payload)
+                        raw_obj = call_openai_for_json(messages, model=args.model)
+                        narrative_obj = validate_narrative_schema(raw_obj, payload=payload)
+                        save_json(Path("data/processed/narrative.json"), narrative_obj)
+                        save_md(Path("data/processed/narrative.md"), render_markdown(narrative_obj))
+                    except Exception as exc:
+                        _log(f"Narrate failed but continuing: {exc}")
+            else:
+                _log("Skipping narrate (per flag).")
+
+            _log("Rendering report...")
+            report_path = generate_report()
+            _log(f"Report written to {report_path}")
+
+            _log("Publishing site...")
+            index_path, published_report = publish_latest()
+            _log(f"Published site at {index_path}")
+            _log(f"Report HTML at {published_report}")
+        except Exception as exc:
+            raise SystemExit(f"refresh failed: {exc}") from exc
         return
     if args.cmd == "build-site":
         from nyc311_weekly_report.dashboard import main as dashboard_main
