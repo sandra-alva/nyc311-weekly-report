@@ -55,10 +55,9 @@ def fetch_last_n_days_soda3(n_days: int = 7, page_size: int = 5000) -> tuple[lis
 
 
 
-def save_raw_snapshot(rows: list[dict[str, Any]], out_path: Path) -> None:
+def save_raw_snapshot(payload: dict[str, Any] | list[dict[str, Any]], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False)
-
+        json.dump(payload, f, ensure_ascii=False)
 
 

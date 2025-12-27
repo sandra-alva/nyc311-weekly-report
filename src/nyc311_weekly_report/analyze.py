@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 RAW_DIR = Path("data/raw")
 PROCESSED_DIR = Path("data/processed")
+NY_TZ = ZoneInfo("America/New_York")
 
 
 
@@ -36,12 +39,44 @@ def compute_weekly_metrics(rows: list[dict[str, Any]], meta: dict[str, Any] | No
     meta = meta or {}
     window_start = meta.get("start")
     window_end = meta.get("end")
+    days_requested = meta.get("days")
 
     total = len(rows)
 
     created_vals = [r.get("created_date") for r in rows if r.get("created_date")]
     created_min = min(created_vals) if created_vals else None
     created_max = max(created_vals) if created_vals else None
+
+    # Weekly freshness / coverage
+    latest_dt = None
+    unique_days: set[str] = set()
+    for val in created_vals:
+        try:
+            dt_utc = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            dt_ny = dt_utc.astimezone(NY_TZ)
+            latest_dt = dt_ny if latest_dt is None or dt_ny > latest_dt else latest_dt
+            unique_days.add(dt_ny.date().isoformat())
+        except Exception:
+            # Skip bad timestamps
+            continue
+    weekly_latest_created_date = latest_dt.isoformat() if latest_dt else None
+    weekly_unique_days_count = len(unique_days)
+
+    weekly_expected_days = None
+    if days_requested:
+        weekly_expected_days = int(days_requested)
+    elif window_start and window_end:
+        try:
+            ws = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+            we = datetime.fromisoformat(window_end.replace("Z", "+00:00"))
+            weekly_expected_days = max(1, int((we - ws).total_seconds() // 86400))
+        except Exception:
+            weekly_expected_days = None
+    weekly_missing_days_est = (
+        max(0, weekly_expected_days - weekly_unique_days_count)
+        if weekly_expected_days is not None
+        else None
+    )
 
     by_complaint = Counter(r.get("complaint_type") or "Unknown" for r in rows)
 
@@ -65,6 +100,10 @@ def compute_weekly_metrics(rows: list[dict[str, Any]], meta: dict[str, Any] | No
         "created_date_max": created_max,
         "window_start": window_start,
         "window_end": window_end,
+        "weekly_latest_created_date": weekly_latest_created_date,
+        "weekly_unique_days_count": weekly_unique_days_count,
+        "weekly_expected_days": weekly_expected_days,
+        "weekly_missing_days_est": weekly_missing_days_est,
         "total_rows": total,
         "top_complaints": top_complaints,
         "top_boroughs": top_boroughs,
